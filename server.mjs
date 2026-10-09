@@ -71,6 +71,91 @@ async function pollRug() {
   }
 }
 let metaCache = { ts: 0, data: [] };
+let ofCache = {}; // symbol -> {ts, data} orderflow L2 (KuCoin, tanpa key)
+// L2 per symbol di KuCoin (gratis, tanpa key)
+const KC_SYM = { WIF: "WIF-USDT", BONK: "BONK-USDT", POPCAT: "POPCAT-USDT", BTC: "BTC-USDT", XAU: "PAXG-USDT" };
+// Fallback Coinbase (gratis, tanpa key) kalau KuCoin rate-limit
+const CB_SYM = { WIF: "WIF-USD", BONK: "BONK-USD", BTC: "BTC-USD", XAU: "PAXG-USD" };
+let wallPrev = {}; // symbol -> walls snapshot sebelumnya (deteksi spoof: tembok muncul/hilang)
+// Orderflow + heatmap L2: walls institusi, imbalance, prints gede, spoof
+async function orderflow(sym) {
+  const kc = KC_SYM[sym];
+  if (!kc) return { error: "unknown symbol" };
+  const c = ofCache[sym];
+  if (c && Date.now() - c.ts < 15000) return c.data;
+  const calcFlow = (tr) => {
+    let bv = 0, sv = 0, nb = 0, ns = 0, last = null;
+    const prints = [];
+    for (const t of tr) {
+      const usd = Number(t.price) * Number(t.size);
+      last = Number(t.price) || last;
+      if (t.side === "buy") { bv += usd; nb++; } else { sv += usd; ns++; }
+      if (usd >= 1000) prints.push({ price: Number(t.price), usd: Math.round(usd), side: t.side, ts: t.time });
+    }
+    return { buyVol: Math.round(bv), sellVol: Math.round(sv), nBuy: nb, nSell: ns, imbalance: bv + sv > 0 ? Math.round((bv / (bv + sv)) * 100) : 50, prints: prints.slice(0, 10), last };
+  };
+  const degenerate = (f) => f && (f.nBuy + f.nSell) >= 20 && (f.nBuy === 0 || f.nSell === 0);
+  const out = { symbol: sym, bids: [], asks: [], walls: [], flow: null, spoof: [], src: "", last: null, bestBid: null, bestAsk: null };
+  const WALL_USD = sym === "BTC" || sym === "XAU" ? 100000 : 10000;
+  const px = (lvl) => ({ price: Number(lvl[0]), size: Number(lvl[1]), usd: Number(lvl[0]) * Number(lvl[1]) });
+  const calcWalls = () => {
+    const walls = [...out.bids.map((x) => ({ ...x, side: "BID" })), ...out.asks.map((x) => ({ ...x, side: "ASK" }))].filter((x) => x.usd >= WALL_USD);
+    out.walls = walls;
+    const prevKeys = new Set((wallPrev[sym] || []).map((w) => w.price + w.side));
+    for (const w of walls) {
+      if (!prevKeys.has(w.price + w.side)) {
+        out.spoof.push({ event: "WALL-MUNCUL", ...w });
+        if (w.usd >= WALL_USD * 2) db.prepare("INSERT INTO alerts(wallet,rule,msg,ts) VALUES(?,?,?,?)").run(sym, "wall", `🧱 WALL ${w.side} $${Math.round(w.usd).toLocaleString()} ${sym} @${w.price}`, now());
+      }
+    }
+    const curKeys = new Set(walls.map((w) => w.price + w.side));
+    for (const w of (wallPrev[sym] || [])) {
+      if (!curKeys.has(w.price + w.side)) out.spoof.push({ event: "WALL-HILANG", ...w });
+    }
+    wallPrev[sym] = walls;
+  };
+  try {
+    const b = await fetch(`https://api.kucoin.com/api/v1/market/orderbook/level2_20?symbol=${kc}`);
+    if (b.ok) {
+      const bj = await b.json();
+      out.bids = (bj?.data?.bids || []).slice(0, 20).map(px);
+      out.asks = (bj?.data?.asks || []).slice(0, 20).map(px);
+      out.src = "kucoin";
+      calcWalls();
+    }
+    const h = await fetch(`https://api.kucoin.com/api/v1/market/histories?symbol=${kc}`);
+    if (h.ok) {
+      const hj = await h.json();
+      out.flow = calcFlow((hj?.data || []).slice(0, 50));
+      // Data aneh (100% satu sisi, size seragam = feed bot/ladder) → jangan dipercaya, ambil Coinbase
+      if (degenerate(out.flow)) { out.flow = null; out.src += "|kucoin-flow-suspect"; }
+    }
+  } catch (e) { console.log("[of-err]", sym, e.message); }
+  if ((!out.bids.length || !out.flow) && CB_SYM[sym]) {
+    // Fallback Coinbase
+    try {
+      const cb = CB_SYM[sym];
+      const b = await fetch(`https://api.exchange.coinbase.com/products/${cb}/book?level=2`);
+      if (b.ok && !out.bids.length) {
+        const bj = await b.json();
+        out.bids = (bj?.bids || []).slice(0, 20).map(px);
+        out.asks = (bj?.asks || []).slice(0, 20).map(px);
+        out.src = (out.src ? out.src + "+" : "") + "coinbase-book";
+        calcWalls();
+      }
+      const h = await fetch(`https://api.exchange.coinbase.com/products/${cb}/trades?limit=50`);
+      if (h.ok && !out.flow) {
+        out.flow = calcFlow(await h.json());
+        out.src = (out.src ? out.src + "+" : "") + "coinbase-trades";
+      }
+    } catch (e) { console.log("[of-cb-err]", sym, e.message); }
+  }
+  ofCache[sym] = { ts: Date.now(), data: out };
+  if (out.bids.length) { out.bestBid = out.bids[0].price; out.bestAsk = out.asks[0]?.price ?? null; }
+  if (out.flow?.last) out.last = out.flow.last;
+  else if (out.bids.length) out.last = (out.bids[0].price + (out.asks[0]?.price || out.bids[0].price)) / 2;
+  return out;
+}
 let macroCache = { ts: 0, data: [] };
 // Macro gratis (tanpa key): BTC (WBTC) + XAU (PAXG gold) via DexScreener — Binance diblokir dari sini
 async function macro() {
@@ -96,6 +181,20 @@ async function macro() {
       }
     } catch {}
   }
+  // Tempel imbalance orderflow (L2 real) biar BTC/XAU ada sinyalnya juga, bukan cuma harga
+  try {
+    for (const m of out) {
+      const of = await orderflow(m.label);
+      if (of?.flow) {
+        m.imb = of.flow.imbalance;
+        m.flowNote = `flow ${of.flow.nBuy}v${of.flow.nSell} · src ${of.src}`;
+        const up = (m.change24h || 0) >= 0;
+        if (up && of.flow.imbalance >= 60) m.regime = "RISK-ON 🟢";
+        else if (!up && of.flow.imbalance <= 40) m.regime = "RISK-OFF 🔴";
+        else m.regime = "CAMPURAN 🟡";
+      }
+    }
+  } catch {}
   if (out.length) macroCache = { ts: Date.now(), data: out };
   return out.length ? out : macroCache.data;
 }
@@ -248,7 +347,7 @@ async function memeList() {
           pairCount: pairCount[m] || 1,
           priceUsd: p.priceUsd, priceChange: p.priceChange,
           txns: p.txns, volumeH24: p.volume?.h24, liquidityUsd: p.liquidity?.usd,
-          dex: p.dexId, url: p.url,
+          dex: p.dexId, url: p.url, pairCreatedAt: p.pairCreatedAt || null,
           whaleTx24h: w.c, whaleVol24h: Math.round(w.v),
           rugFlags: [],
         });
@@ -314,7 +413,7 @@ async function priceOf(token) {
 // Prioritas: yang ada aktivitas whale dulu (naik ke atas antrian), sisanya fair
 async function pollDexTrades() {
   for (const s of Object.keys(TOKEN_MINTS)) trackMint(TOKEN_MINTS[s], s, "solana");
-  const queue = db.prepare("SELECT * FROM tracked ORDER BY last_polled ASC LIMIT 6").all();
+  const queue = db.prepare("SELECT * FROM tracked ORDER BY last_polled ASC LIMIT 3").all();
   for (const q of queue) {
     const symbol = q.symbol, mint = q.mint, chain = q.chain || "solana";
     const gnet = GECKO_NET[chain];
@@ -323,23 +422,27 @@ async function pollDexTrades() {
       let pool = poolCache[poolKey];
       if (!pool) {
         if (!gnet) { db.prepare("UPDATE tracked SET last_polled=? WHERE mint=?").run(now(), mint); continue; } // chain ga didukung Gecko → price-only
-        const r = await fetch(`https://api.geckoterminal.com/api/v2/networks/${gnet}/tokens/${mint}/pools?page=1`);
+        const ctrl = new AbortController();
+        const to = setTimeout(() => ctrl.abort(), 8000);
+        const r = await fetch(`https://api.geckoterminal.com/api/v2/networks/${gnet}/tokens/${mint}/pools?page=1`, { signal: ctrl.signal });
+        clearTimeout(to);
         if (!r.ok) continue;
         const j = await r.json();
         pool = j?.data?.[0]?.attributes?.address;
         if (!pool) continue;
         poolCache[poolKey] = pool;
       }
-      await sleep(1200);
-      // 2 halaman ke belakang (kompromi: hemat tapi tetap nangkep yang gede)
-      for (let page = 1; page <= 2; page++) {
-        const t = await fetch(`https://api.geckoterminal.com/api/v2/networks/${gnet}/pools/${pool}/trades?page=${page}`);
-        if (t.status === 429) { await sleep(15000); break; }
-        if (!t.ok) break;
-        const tj = await t.json();
-        const list = tj?.data || [];
-        if (!list.length) break;
-        for (const tr of list.slice(0, 15)) {
+      await sleep(800);
+      // 1 halaman saja di loop cepat (cepat); 2 halaman di loop lambat
+      const ctrl2 = new AbortController();
+      const to2 = setTimeout(() => ctrl2.abort(), 8000);
+      const t = await fetch(`https://api.geckoterminal.com/api/v2/networks/${gnet}/pools/${pool}/trades?page=1`, { signal: ctrl2.signal });
+      clearTimeout(to2);
+      if (t.status === 429) { await sleep(15000); continue; }
+      if (!t.ok) continue;
+      const tj = await t.json();
+      const list = tj?.data || [];
+      for (const tr of list.slice(0, 15)) {
         const a = tr?.attributes || {};
         const sig = chain + ":" + (a.tx_hash || "") + ":" + (a.kind || "");
         if (!sig || sig === (chain + "::")) continue;
@@ -351,11 +454,10 @@ async function pollDexTrades() {
         if (usd >= WHALE_TX_USD) {
           db.prepare("INSERT INTO alerts(wallet,transfer_sig,rule,msg,ts) VALUES(?,?,?,?,?)").run(maker, sig, "dex-whale-trade", `DEX ${a.kind?.toUpperCase()} $${Math.round(usd).toLocaleString()} ${symbol} [${chain}] @${maker.slice(0, 8)}`, now());
         }
-        }
       }
       db.prepare("UPDATE tracked SET last_polled=? WHERE mint=?").run(now(), mint);
     } catch (e) { console.log("[dex-err]", symbol, e.message); }
-    await sleep(1200);
+    await sleep(800);
   }
 }
 
@@ -452,7 +554,7 @@ async function pollSlow() {
   } catch (e) { console.log("[slow-err]", e.message); }
   finally { lastRun.slow = Date.now(); lastRun.slowMs = Date.now() - t0; slowing = false; }
 }
-setInterval(pollFast, 45000); setInterval(pollSlow, 8 * 60 * 1000); pollSlow(); pollFast(); // slow dulu biar ga di-skip guard
+setInterval(pollFast, 90000); setInterval(pollSlow, 8 * 60 * 1000); pollSlow(); pollFast(); // slow dulu biar ga di-skip guard
 
 function serveStatic(req, res) {
   let p = req.url.split("?")[0];
@@ -498,6 +600,21 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === "/api/prices" && req.method === "GET") return send(res, 200, db.prepare("SELECT * FROM prices").all());
     if (u.pathname === "/api/meme-list" && req.method === "GET") return send(res, 200, await memeList());
     if (u.pathname === "/api/signals" && req.method === "GET") return send(res, 200, await signals());
+    if (u.pathname === "/api/token" && req.method === "GET") {
+      const mint = u.searchParams.get("mint");
+      if (!mint) return send(res, 400, { error: "mint required" });
+      const list = await memeList();
+      const info = list.find((x) => x.mint === mint) || null;
+      const sym = info?.symbol;
+      const rug = db.prepare("SELECT * FROM rug WHERE mint=?").get(mint);
+      const tx = sym ? db.prepare("SELECT * FROM transfers WHERE token=? ORDER BY usd_value DESC LIMIT 15").all(sym) : [];
+      const sig = (await signals()).find((s) => s.symbol === sym) || null;
+      return send(res, 200, {
+        info, signal: sig, transfers: tx,
+        rug: rug ? { ...rug, risks: JSON.parse(rug.risks || "[]") } : null,
+      });
+    }
+    if (u.pathname === "/api/orderflow" && req.method === "GET") return send(res, 200, await orderflow(u.searchParams.get("symbol") || "WIF"));
     if (u.pathname === "/api/status" && req.method === "GET") return send(res, 200, { fastSecAgo: Math.round((Date.now() - lastRun.fast) / 1000), fastMs: lastRun.fastMs, slowSecAgo: Math.round((Date.now() - lastRun.slow) / 1000), slowMs: lastRun.slowMs, polling, slowing });
     const mRug = u.pathname.match(/^\/api\/rug\/(.+)$/);
     if (mRug && req.method === "GET") {
